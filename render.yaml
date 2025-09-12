@@ -1,1 +1,18 @@
+services:
+  - type: web
+    name: disha-bot
+    env: docker
+    plan: free
+    buildCommand: ""
+    startCommand: ""
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: ENABLE_TTS
+        value: "1"
+      - key: VOICE_NAME
+        value: "hi-IN-SwaraNeural"
+
 
