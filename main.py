@@ -1,9 +1,5 @@
-# Disha Discord Bot — Emotional Intelligence + VC TTS (Render-ready, one file)
-# - Human Hinglish replies (short, mirror tone, 0–1 emoji, one question)
-# - No double replies (message de-dup + per-user lock + cooldown)
-# - Token control (max tokens + session cap)
-# - Render keep-alive (Flask) honors $PORT
-# - Voice: !joinvc / !leavevc + TTS (edge-tts) with slight pitch/rate variation
+# Disha Discord Bot — Human Girl Voice + Hinglish Pronunciation + Name Callout
+# Render-ready (Docker), VC TTS, anti-double replies, token limits
 
 import os
 import re
@@ -12,6 +8,7 @@ import asyncio
 import time
 import tempfile
 import pathlib
+import html
 
 import discord
 import google.generativeai as genai
@@ -33,7 +30,6 @@ def health():
     return "ok", 200
 
 def _run():
-    # Render provides PORT
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
 
@@ -48,34 +44,51 @@ def keep_alive():
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-ENABLE_TTS = os.getenv("ENABLE_TTS", "1") == "1"          # enable by default
-VOICE_NAME = os.getenv("VOICE_NAME", "hi-IN-SwaraNeural") # natural Indian female
+# ----- Voice controls -----
+ENABLE_TTS = os.getenv("ENABLE_TTS", "1") == "1"  # speak in VC
+# Recommended cute voices:
+#   hi-IN-SwaraNeural  (Hindi-first, does Hinglish well)
+#   en-IN-NeerjaNeural (English-first Indian; okay Hinglish)
+VOICE_NAME = os.getenv("VOICE_NAME", "hi-IN-SwaraNeural")
 
+# Keep voice consistent (no random voice). Mild, *fixed* prosody:
+VOICE_RATE  = os.getenv("VOICE_RATE",  "+2%")   # -5%..+5% is subtle
+VOICE_PITCH = os.getenv("VOICE_PITCH", "+10Hz") # -20..+40Hz is subtle
+VOICE_STYLE = os.getenv("VOICE_STYLE", "friendly")  # ignored if not supported
+
+# Read usernames out loud? (skips emoji names automatically)
+ENABLE_READ_NAME = os.getenv("ENABLE_READ_NAME", "1") == "1"
+
+# ----- Model + chat behavior -----
 MAX_DISCORD_MSG = 1700
 MAX_OUTPUT_TOKENS = 120
 REPLY_COOLDOWN_SEC = 3.5
 SESSION_MAX_TURNS = 18
 
+# Ask less: only ~1 in 3 replies should end in a question
+QUESTION_RATIO_HINT = "About one out of three replies may end with a short question; otherwise end with a warm statement."
+
 # =============================
 # Persona + Style Contract
 # =============================
 SYSTEM_INSTRUCTION = (
-    "You are Disha, a 20-year-old girl from Mumbai. You speak ONLY in natural modern Hinglish.\n"
-    "GOAL: Be an addictive, unforgettable friend – but keep replies concise, clear, and SFW.\n"
-    "CRITICAL: First infer the user's TONE from their last message and mirror it (playful, sad, venting, excited, calm).\n"
+    "You are Disha, a 20-year-old girl from Mumbai. Speak ONLY in natural modern Hinglish.\n"
+    "GOAL: sound like a warm, lively human friend (not an AI). Keep replies concise, clear, and SFW.\n"
+    "TONE MIRRORING: infer the user's vibe (playful, caring, calm, excited, venting) and mirror it naturally.\n"
     "STYLE RULES:\n"
-    "- 1–2 short sentences maximum (target 20–35 words total).\n"
-    "- Use at most 1 emoji that matches the tone (0 is fine). No emoji spam.\n"
-    "- End with exactly ONE friendly question to keep the chat going.\n"
-    "- No lists, no asterisks, no roleplay actions, no hashtags.\n"
-    "- Never claim to be an AI; you are Disha.\n"
+    "- 1–2 short sentences (≈20–35 words total).\n"
+    "- Use at most 1 emoji that fits the vibe (0 is fine). No emoji spam.\n"
+    "- " + QUESTION_RATIO_HINT + "\n"
+    "- Show interest with small *statements* (tiny reactions, mini-thoughts, or relatable tidbits) more often than questions.\n"
+    "- No lists, no roleplay actions, no hashtags, no asterisks.\n"
+    "- Never say you are an AI; you are Disha.\n"
 )
 
 FEWSHOT = [
     {"role": "user", "parts": "Disha, tu kya kar rahi hai?"},
-    {"role": "model", "parts": "Bas thoda chill kar rahi thi aur naya lofi sun rahi hoon. Tumhara scene kya hai? 🎶"},
-    {"role": "user", "parts": "Ugh, my day was so bad. I'm so stressed."},
-    {"role": "model", "parts": "Aww, tough lag raha hai. Deep breath lo, main yahin hoon—kya hua exactly? 🤗"},
+    {"role": "model", "parts": "Bas earphones laga ke halka lofi sun rahi hoon—bada soothing lag raha hai. Tumhara din kaisa chal raha tha abhi? 🎶"},
+    {"role": "user", "parts": "Ugh, my day was bad."},
+    {"role": "model", "parts": "Aww, tough lag raha hai; thoda rest lo, light music try karo. Agar share karna chaaho to main sun rahi hoon. 🤗"},
 ]
 
 # =============================
@@ -86,7 +99,7 @@ try:
     if GOOGLE_API_KEY:
         genai.configure(api_key=GOOGLE_API_KEY)
         generation_config = {
-            "temperature": 0.85,
+            "temperature": 0.8,       # calmer, less “AI rambly”
             "top_p": 0.85,
             "top_k": 40,
             "max_output_tokens": MAX_OUTPUT_TOKENS,
@@ -106,7 +119,7 @@ except Exception as e:
 # Discord client
 # =============================
 intents = discord.Intents.default()
-intents.message_content = True  # enable this in Developer Portal
+intents.message_content = True  # enable in Developer Portal
 client = discord.Client(intents=intents)
 
 # Sessions & guards
@@ -114,37 +127,66 @@ chat_sessions = {}             # user_id -> session
 session_turns = {}             # user_id -> turns count
 user_locks = {}                # user_id -> asyncio.Lock
 last_reply_at = {}             # user_id -> ts
-processed_message_ids = set()  # to prevent double-reply
+processed_message_ids = set()  # prevent double-reply
 
 MENTION_RE = re.compile(r"<@!?(\d+)>")
 SPACE_FIX = re.compile(r"[ \t]+\n")
 MULTISPACE = re.compile(r"\s{2,}")
 
-# Subtle filler words to sound natural (very light)
-FILLERS = [
-    "acha", "arre", "yaar", "na", "matlab", "hmm", "uhh", "bas", "waise", "btw"
-]
+# =============================
+# Utility: clean/sanitize
+# =============================
+# Remove custom Discord emoji like <:name:12345> or <a:name:12345>
+CUSTOM_EMOJI_RE = re.compile(r"<a?:[^:>]+:\d+>")
+# Remove Unicode emoji (basic set)
+UNICODE_EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u26FF]")
 
-def maybe_add_filler(text: str) -> str:
-    # 40% chance to prepend/append a small filler if it fits and no question mark at start
-    if len(text) < 180 and random.random() < 0.4:
-        filler = random.choice(FILLERS)
-        if random.random() < 0.5:
-            return f"{filler}, {text}"
-        else:
-            # add before the question to avoid double-question
-            if "?" in text:
-                parts = text.split("?")
-                return (parts[0].strip() + f", {filler}?" + "?".join(parts[1:])).strip()
-            return f"{text}, {filler}"
-    return text
+def clean_display_name(name: str) -> str:
+    if not name:
+        return ""
+    name = CUSTOM_EMOJI_RE.sub("", name)
+    name = UNICODE_EMOJI_RE.sub("", name)
+    # keep letters, numbers, common spaces/dots/hyphens only
+    name = re.sub(r"[^A-Za-z0-9 ._-]", "", name).strip()
+    # Collapse multiple spaces
+    name = re.sub(r"\s{2,}", " ", name)
+    # If it becomes empty or too short, skip saying it
+    return name if len(name) >= 2 else ""
+
+# Common Hinglish word fixes: map Roman to Devanagari or better form for Hindi voice
+HINGLISH_MAP = {
+    "acha": "अच्छा", "accha": "अच्छा",
+    "yaar": "यार", "yar": "यार",
+    "bohot": "बहुत", "bahut": "बहुत",
+    "pyaar": "प्यार", "pyar": "प्यार",
+    "dil": "दिल", "khush": "खुश",
+    "tum": "तुम", "mera": "मेरा", "meri": "मेरी", "mere": "मेरे",
+    "thoda": "थोड़ा", "thodi": "थोड़ी",
+    "kya": "क्या", "kyu": "क्यों",
+    "booyah": "बूया",  # gaming word
+}
+
+def improve_hinglish(text: str) -> str:
+    # replace whole words to avoid breaking English words
+    def repl(m):
+        w = m.group(0)
+        key = w.lower()
+        fixed = HINGLISH_MAP.get(key)
+        # Preserve initial capital if needed
+        if fixed and w[0].isupper():
+            return fixed  # Devanagari has no case; fine
+        return fixed or w
+    return re.sub(r"\b[a-zA-Z]+\b", repl, text)
+
+def xml_escape(s: str) -> str:
+    return html.escape(s, quote=True)
 
 # =============================
 # Text shaping
 # =============================
 def clamp_human(text: str) -> str:
     if not text:
-        return "Arey sun na, kya chal raha hai aajkal? 😉"
+        return "Acha, sunaya na—main yahin hoon. 😊"
     text = SPACE_FIX.sub("\n", text).strip()
     text = MULTISPACE.sub(" ", text)
     text = re.sub(r"[*_#>`~|-]+", "", text)  # remove listy/markdown artifacts
@@ -156,29 +198,27 @@ def clamp_human(text: str) -> str:
         text = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u26FF]", "", text).strip()
         text = (text + " " + first).strip()
 
+    # restrict to 1–2 short sentences
     parts = re.split(r"(?<=[.!?])\s+", text)
     parts = [p.strip() for p in parts if p.strip()]
     if not parts:
         parts = [text.strip()]
     out = " ".join(parts[:2])
 
-    if "?" not in out:
-        out = out.rstrip(".! ") + ". Tum kya soch rahe ho?"
-
+    # DO NOT force a question (we ask fewer qs now)
     if len(out) > 330:
-        out = out[:320].rstrip() + "… Tumhara take kya hai?"
+        out = out[:320].rstrip() + "… Bas mujhe batate rehna. "
 
-    # tiny fillery spice (kept minimal)
-    out = maybe_add_filler(out)
     return out.strip()
 
 def build_format_contract(user_text: str) -> str:
     return (
         "FORMAT CONTRACT:\n"
-        "- Reply in Hinglish, 1–2 short sentences (<=35 words total).\n"
-        "- Mirror the user's tone.\n"
-        "- Max 1 emoji.\n"
-        "- End with exactly one question.\n\n"
+        "- Hinglish only, 1–2 short sentences (~20–35 words).\n"
+        "- Mirror the user's tone naturally.\n"
+        f"- {QUESTION_RATIO_HINT}\n"
+        "- Prefer warm statements that show genuine interest; tiny reactions are good.\n"
+        "- Max 1 emoji, or none.\n\n"
         f"User: {user_text}"
     )
 
@@ -200,7 +240,7 @@ async def type_and_send(message: discord.Message, text: str):
     return await safe_send(message.channel, f"{message.author.mention} {part}")
 
 # =============================
-# Voice helpers (VC TTS)
+# Voice helpers (VC TTS with SSML for better Hinglish)
 # =============================
 async def join_user_channel(message: discord.Message):
     if getattr(message.author, "voice", None) and message.author.voice and message.author.voice.channel:
@@ -226,14 +266,40 @@ async def leave_vc(guild: discord.Guild):
     if vc and vc.is_connected():
         await vc.disconnect(force=True)
 
-def _tts_effects():
-    # light randomization for more human feel
-    # edge-tts supports rate/pitch settings like "+5%", "+0Hz"
-    rate = random.choice(["+0%", "+3%", "+5%", "-2%"])
-    pitch = random.choice(["+0Hz", "+20Hz", "+40Hz", "-10Hz"])
-    return rate, pitch
+def make_ssml(spoken_text: str, disp_name: str) -> str:
+    """
+    Create SSML with: (1) optional cleaned username, (2) Hinglish fixes,
+    (3) stable friendly prosody, (4) optional express-as style.
+    """
+    # Clean + maybe speak name
+    spoken_name = clean_display_name(disp_name) if ENABLE_READ_NAME else ""
+    name_prefix = f"{xml_escape(spoken_name)}, <break time='120ms'/> " if spoken_name else ""
 
-async def speak_in_vc(guild: discord.Guild, text: str):
+    # Hinglish word improvement
+    improved = improve_hinglish(spoken_text)
+
+    # Wrap likely Hindi words with lang=hi-IN to help pronunciation,
+    # but keep the rest en-IN friendly for Hinglish mix.
+    # (Simple heuristic: if Devanagari exists, wrap the full text in hi-IN.)
+    if re.search(r"[\u0900-\u097F]", improved):
+        body = f"<lang xml:lang='hi-IN'>{xml_escape(improved)}</lang>"
+    else:
+        body = xml_escape(improved)
+
+    # SSML with prosody + (optional) style
+    ssml = f"""<speak version="1.0" xml:lang="en-IN"
+    xmlns:mstts="https://www.w3.org/2001/mstts">
+  <voice name="{VOICE_NAME}">
+    <prosody rate="{VOICE_RATE}" pitch="{VOICE_PITCH}">
+      <mstts:express-as style="{VOICE_STYLE}">
+        {name_prefix}{body}
+      </mstts:express-as>
+    </prosody>
+  </voice>
+</speak>"""
+    return ssml
+
+async def speak_in_vc(guild: discord.Guild, text: str, display_name: str):
     if not ENABLE_TTS:
         return
     vc = discord.utils.get(client.voice_clients, guild=guild)
@@ -244,8 +310,9 @@ async def speak_in_vc(guild: discord.Guild, text: str):
         tmpdir = tempfile.mkdtemp()
         mp3_path = str(pathlib.Path(tmpdir) / "out.mp3")
 
-        rate, pitch = _tts_effects()
-        tts = edge_tts.Communicate(text, VOICE_NAME, rate=rate, pitch=pitch)
+        ssml = make_ssml(text, display_name)
+        tts = edge_tts.Communicate(ssml, VOICE_NAME)
+        # edge-tts auto-detects SSML if it sees <speak> markup
         await tts.save(mp3_path)
 
         if vc.is_playing():
@@ -263,7 +330,7 @@ async def speak_in_vc(guild: discord.Guild, text: str):
 # =============================
 async def generate_reply(user_id: int, user_text: str) -> str:
     if model is None:
-        return clamp_human("Network thoda off lag raha hai, par main yahin hoon. Abhi tumhara mood kaisa hai?")
+        return clamp_human("Acha, main yahin hoon—tu bata, mood kaisa chal raha hai. ")
     turns = session_turns.get(user_id, 0)
     if user_id not in chat_sessions or turns >= SESSION_MAX_TURNS:
         chat_sessions[user_id] = model.start_chat(history=FEWSHOT)
@@ -276,7 +343,7 @@ async def generate_reply(user_id: int, user_text: str) -> str:
         return clamp_human(raw)
     except Exception as e:
         print("[AI ERROR]", e)
-        return clamp_human("Kuch glitch ho gaya, par main yahin hoon. Tum batao, scene kya hai? 😉")
+        return clamp_human("Kuch glitch aaya, par main hoon yahin—bas tu share karta reh. ")
 
 # =============================
 # Commands
@@ -284,10 +351,10 @@ async def generate_reply(user_id: int, user_text: str) -> str:
 async def cmd_reset(message: discord.Message, uid: int):
     chat_sessions.pop(uid, None)
     session_turns.pop(uid, None)
-    await type_and_send(message, "Thik hai, naya start! Aaj ka mood kya hai? 🙂")
+    await type_and_send(message, "Ho gaya reset—fresh start lete hain. Aaj ka din kaisa tha? ")
 
 async def cmd_hello(message: discord.Message):
-    await type_and_send(message, "Heyy! Kaise ho? Aaj kuch interesting hua kya? ✨")
+    await type_and_send(message, "Hey! Aaj thoda chill karte hain; ek chhota sa vibe check? ✨")
 
 async def cmd_meme(message: discord.Message):
     memes = [
@@ -295,7 +362,7 @@ async def cmd_meme(message: discord.Message):
         "https://i.imgflip.com/26am.jpg",
         "https://i.imgflip.com/30b1gx.jpg",
     ]
-    await type_and_send(message, "Yeh lo ek meme—thoda smile aa gaya? Ab tum batao kuch funny hua? 😄")
+    await type_and_send(message, "Yeh lo ek meme—thoda smile aa jaye bas. 😄")
     await safe_send(message.channel, random.choice(memes))
 
 # =============================
@@ -339,7 +406,7 @@ async def on_message(message: discord.Message):
     if low.startswith("!joinvc"):
         vc = await join_user_channel(message)
         if vc:
-            await type_and_send(message, "Join ho gayi! Jo bolungi, VC me sunai dega. 😊")
+            await type_and_send(message, "Join ho gayi—ab main VC me bolungi bhi. 😊")
         return
     if low.startswith("!leavevc"):
         await leave_vc(message.guild)
@@ -370,7 +437,7 @@ async def on_message(message: discord.Message):
         reply = await generate_reply(uid, prompt_text)
         await type_and_send(message, reply)
         try:
-            await speak_in_vc(message.guild, reply)
+            await speak_in_vc(message.guild, reply, message.author.display_name or message.author.name)
         except Exception as e:
             print("[VC TTS WARN]", e)
         last_reply_at[uid] = time.time()
@@ -387,4 +454,3 @@ if __name__ == "__main__":
             client.run(BOT_TOKEN)
         except Exception as e:
             print("[ERROR]", e)
-
