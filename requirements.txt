@@ -3,4 +3,3 @@ PyNaCl
 Flask
 google-generativeai
 edge-tts
-
