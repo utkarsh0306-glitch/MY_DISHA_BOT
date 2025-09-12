@@ -14,5 +14,11 @@ services:
         value: "1"
       - key: VOICE_NAME
         value: "hi-IN-SwaraNeural"
-
-
+      - key: VOICE_RATE
+        value: "+2%"
+      - key: VOICE_PITCH
+        value: "+10Hz"
+      - key: VOICE_STYLE
+        value: "friendly"
+      - key: ENABLE_READ_NAME
+        value: "1"
