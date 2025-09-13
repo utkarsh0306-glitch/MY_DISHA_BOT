@@ -1,5 +1,8 @@
-# Disha Discord Bot — Human Girl Voice + Hinglish Pronunciation + Name Callout
-# Render-ready (Docker), VC TTS, anti-double replies, token limits
+# Disha Discord Bot — human vibe + VC TTS
+# Fixes:
+# - Strong single-reply guard (no doubles)
+# - TTS sanitization (won't read code/mentions/links)
+# - Cute stable voice + better Hinglish + name callout
 
 import os
 import re
@@ -9,6 +12,7 @@ import time
 import tempfile
 import pathlib
 import html
+from collections import deque
 
 import discord
 import google.generativeai as genai
@@ -45,18 +49,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # ----- Voice controls -----
-ENABLE_TTS = os.getenv("ENABLE_TTS", "1") == "1"  # speak in VC
-# Recommended cute voices:
-#   hi-IN-SwaraNeural  (Hindi-first, does Hinglish well)
-#   en-IN-NeerjaNeural (English-first Indian; okay Hinglish)
-VOICE_NAME = os.getenv("VOICE_NAME", "hi-IN-SwaraNeural")
-
-# Keep voice consistent (no random voice). Mild, *fixed* prosody:
-VOICE_RATE  = os.getenv("VOICE_RATE",  "+2%")   # -5%..+5% is subtle
-VOICE_PITCH = os.getenv("VOICE_PITCH", "+10Hz") # -20..+40Hz is subtle
-VOICE_STYLE = os.getenv("VOICE_STYLE", "friendly")  # ignored if not supported
-
-# Read usernames out loud? (skips emoji names automatically)
+ENABLE_TTS = os.getenv("ENABLE_TTS", "1") == "1"
+VOICE_NAME = os.getenv("VOICE_NAME", "hi-IN-SwaraNeural")  # try en-IN-NeerjaNeural too
+VOICE_RATE  = os.getenv("VOICE_RATE",  "+2%")
+VOICE_PITCH = os.getenv("VOICE_PITCH", "+10Hz")
+VOICE_STYLE = os.getenv("VOICE_STYLE", "friendly")
 ENABLE_READ_NAME = os.getenv("ENABLE_READ_NAME", "1") == "1"
 
 # ----- Model + chat behavior -----
@@ -64,9 +61,10 @@ MAX_DISCORD_MSG = 1700
 MAX_OUTPUT_TOKENS = 120
 REPLY_COOLDOWN_SEC = 3.5
 SESSION_MAX_TURNS = 18
-
-# Ask less: only ~1 in 3 replies should end in a question
 QUESTION_RATIO_HINT = "About one out of three replies may end with a short question; otherwise end with a warm statement."
+
+# For diagnosing duplicates
+INSTANCE_ID = os.getenv("RENDER_INSTANCE_ID") or os.getenv("HOSTNAME") or str(os.getpid())
 
 # =============================
 # Persona + Style Contract
@@ -79,7 +77,7 @@ SYSTEM_INSTRUCTION = (
     "- 1–2 short sentences (≈20–35 words total).\n"
     "- Use at most 1 emoji that fits the vibe (0 is fine). No emoji spam.\n"
     "- " + QUESTION_RATIO_HINT + "\n"
-    "- Show interest with small *statements* (tiny reactions, mini-thoughts, or relatable tidbits) more often than questions.\n"
+    "- Prefer warm statements that show genuine interest over constant questions.\n"
     "- No lists, no roleplay actions, no hashtags, no asterisks.\n"
     "- Never say you are an AI; you are Disha.\n"
 )
@@ -99,7 +97,7 @@ try:
     if GOOGLE_API_KEY:
         genai.configure(api_key=GOOGLE_API_KEY)
         generation_config = {
-            "temperature": 0.8,       # calmer, less “AI rambly”
+            "temperature": 0.8,
             "top_p": 0.85,
             "top_k": 40,
             "max_output_tokens": MAX_OUTPUT_TOKENS,
@@ -119,7 +117,7 @@ except Exception as e:
 # Discord client
 # =============================
 intents = discord.Intents.default()
-intents.message_content = True  # enable in Developer Portal
+intents.message_content = True
 client = discord.Client(intents=intents)
 
 # Sessions & guards
@@ -127,18 +125,71 @@ chat_sessions = {}             # user_id -> session
 session_turns = {}             # user_id -> turns count
 user_locks = {}                # user_id -> asyncio.Lock
 last_reply_at = {}             # user_id -> ts
-processed_message_ids = set()  # prevent double-reply
+
+# --- single-reply guard across this process + avoid repeating same sentence
+_PROCESSED_IDS = set()
+_PROCESSED_ORDER = deque(maxlen=10000)
+_LAST_REPLY_NORM = {}  # user_id -> last normalized reply
+
+def already_processed(mid: int) -> bool:
+    if mid in _PROCESSED_IDS:
+        return True
+    _PROCESSED_IDS.add(mid)
+    _PROCESSED_ORDER.append(mid)
+    if len(_PROCESSED_ORDER) == _PROCESSED_ORDER.maxlen:
+        old = _PROCESSED_ORDER.popleft()
+        _PROCESSED_IDS.discard(old)
+    return False
+
+def _norm_reply(s: str) -> str:
+    s = re.sub(r"\s+", " ", (s or "").strip().lower())
+    return re.sub(r"[!? .]+$", "", s)
 
 MENTION_RE = re.compile(r"<@!?(\d+)>")
 SPACE_FIX = re.compile(r"[ \t]+\n")
 MULTISPACE = re.compile(r"\s{2,}")
 
 # =============================
-# Utility: clean/sanitize
+# TTS sanitization (so it won't read code/mentions/links)
 # =============================
-# Remove custom Discord emoji like <:name:12345> or <a:name:12345>
-CUSTOM_EMOJI_RE = re.compile(r"<a?:[^:>]+:\d+>")
-# Remove Unicode emoji (basic set)
+# Mentions/tags
+MENTION_TAG_RE   = re.compile(r"<@!?[0-9]+>")     # user mention
+ROLE_TAG_RE      = re.compile(r"<@&[0-9]+>")      # role mention
+CHANNEL_TAG_RE   = re.compile(r"<#[0-9]+>")       # channel mention
+TIMESTAMP_TAG_RE = re.compile(r"<t:[0-9]+(?::[a-zA-Z])?>")
+CUSTOM_EMOJI_RE  = re.compile(r"<a?:[^:>]+:\d+>") # <:name:123>, <a:name:123>
+
+# Links / code
+URL_RE           = re.compile(r"https?://\S+")
+MD_LINK_RE       = re.compile(r"\[([^\]]+)\]\([^)]+\)")  # [text](url) -> text
+CODE_FENCE_RE    = re.compile(r"```.*?```", re.DOTALL)   # triple-backtick block
+INLINE_CODE_RE   = re.compile(r"`[^`]*`")                # inline code
+
+# Misc markdown/symbol cleanup for speech
+MARKDOWN_SYM_RE  = re.compile(r"[*_~`|>]+")
+AT_SIGN_RE       = re.compile(r"@")  # leftover at-signs
+
+def tts_sanitize(text: str) -> str:
+    # remove big blocks first
+    text = CODE_FENCE_RE.sub(" ", text)
+    # strip mentions/tags/custom emoji
+    for rx in (MENTION_TAG_RE, ROLE_TAG_RE, CHANNEL_TAG_RE, TIMESTAMP_TAG_RE, CUSTOM_EMOJI_RE):
+        text = rx.sub(" ", text)
+    # links -> drop, markdown links -> keep visible text
+    text = URL_RE.sub(" ", text)
+    text = MD_LINK_RE.sub(r"\1", text)
+    # drop inline code/backticks
+    text = INLINE_CODE_RE.sub(" ", text)
+    # clean markdown artifacts
+    text = MARKDOWN_SYM_RE.sub(" ", text)
+    text = AT_SIGN_RE.sub(" ", text)
+    # collapse whitespace / trim
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+# =============================
+# Name cleanup & Hinglish fixes
+# =============================
 UNICODE_EMOJI_RE = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u26FF]")
 
 def clean_display_name(name: str) -> str:
@@ -146,14 +197,10 @@ def clean_display_name(name: str) -> str:
         return ""
     name = CUSTOM_EMOJI_RE.sub("", name)
     name = UNICODE_EMOJI_RE.sub("", name)
-    # keep letters, numbers, common spaces/dots/hyphens only
     name = re.sub(r"[^A-Za-z0-9 ._-]", "", name).strip()
-    # Collapse multiple spaces
     name = re.sub(r"\s{2,}", " ", name)
-    # If it becomes empty or too short, skip saying it
     return name if len(name) >= 2 else ""
 
-# Common Hinglish word fixes: map Roman to Devanagari or better form for Hindi voice
 HINGLISH_MAP = {
     "acha": "अच्छा", "accha": "अच्छा",
     "yaar": "यार", "yar": "यार",
@@ -163,18 +210,17 @@ HINGLISH_MAP = {
     "tum": "तुम", "mera": "मेरा", "meri": "मेरी", "mere": "मेरे",
     "thoda": "थोड़ा", "thodi": "थोड़ी",
     "kya": "क्या", "kyu": "क्यों",
-    "booyah": "बूया",  # gaming word
+    "mast": "मस्त", "scene": "सीन",
+    "booyah": "बूया",
 }
 
 def improve_hinglish(text: str) -> str:
-    # replace whole words to avoid breaking English words
     def repl(m):
         w = m.group(0)
         key = w.lower()
         fixed = HINGLISH_MAP.get(key)
-        # Preserve initial capital if needed
         if fixed and w[0].isupper():
-            return fixed  # Devanagari has no case; fine
+            return fixed
         return fixed or w
     return re.sub(r"\b[a-zA-Z]+\b", repl, text)
 
@@ -186,29 +232,25 @@ def xml_escape(s: str) -> str:
 # =============================
 def clamp_human(text: str) -> str:
     if not text:
-        return "Acha, sunaya na—main yahin hoon. 😊"
+        return "Acha, main yahin hoon—tu bata, mood kaisa chal raha hai. "
     text = SPACE_FIX.sub("\n", text).strip()
     text = MULTISPACE.sub(" ", text)
-    text = re.sub(r"[*_#>`~|-]+", "", text)  # remove listy/markdown artifacts
+    text = re.sub(r"[*_#>`~|-]+", "", text)
 
-    # limit emojis to 1
     emojis = re.findall(r"[\U0001F300-\U0001FAFF\u2600-\u26FF]", text)
     if len(emojis) > 1:
         first = emojis[0]
         text = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u26FF]", "", text).strip()
         text = (text + " " + first).strip()
 
-    # restrict to 1–2 short sentences
     parts = re.split(r"(?<=[.!?])\s+", text)
     parts = [p.strip() for p in parts if p.strip()]
     if not parts:
         parts = [text.strip()]
     out = " ".join(parts[:2])
 
-    # DO NOT force a question (we ask fewer qs now)
     if len(out) > 330:
         out = out[:320].rstrip() + "… Bas mujhe batate rehna. "
-
     return out.strip()
 
 def build_format_contract(user_text: str) -> str:
@@ -216,9 +258,10 @@ def build_format_contract(user_text: str) -> str:
         "FORMAT CONTRACT:\n"
         "- Hinglish only, 1–2 short sentences (~20–35 words).\n"
         "- Mirror the user's tone naturally.\n"
-        f"- {QUESTION_RATIO_HINT}\n"
-        "- Prefer warm statements that show genuine interest; tiny reactions are good.\n"
-        "- Max 1 emoji, or none.\n\n"
+        "- Ask a question at MOST 1 out of 3 replies; otherwise end with a warm statement.\n"
+        "- Show interest with tiny reactions or relatable thoughts.\n"
+        "- Max 1 emoji, or none.\n"
+        "- Do NOT include @mentions, hashtags, links, code, or commands in your reply.\n\n"
         f"User: {user_text}"
     )
 
@@ -240,7 +283,7 @@ async def type_and_send(message: discord.Message, text: str):
     return await safe_send(message.channel, f"{message.author.mention} {part}")
 
 # =============================
-# Voice helpers (VC TTS with SSML for better Hinglish)
+# Voice helpers (VC TTS with SSML)
 # =============================
 async def join_user_channel(message: discord.Message):
     if getattr(message.author, "voice", None) and message.author.voice and message.author.voice.channel:
@@ -267,26 +310,22 @@ async def leave_vc(guild: discord.Guild):
         await vc.disconnect(force=True)
 
 def make_ssml(spoken_text: str, disp_name: str) -> str:
-    """
-    Create SSML with: (1) optional cleaned username, (2) Hinglish fixes,
-    (3) stable friendly prosody, (4) optional express-as style.
-    """
-    # Clean + maybe speak name
+    # Sanitize first so TTS never reads code/mentions/links
+    spoken_text = tts_sanitize(spoken_text)
+
+    # Optional: speak a cleaned username
     spoken_name = clean_display_name(disp_name) if ENABLE_READ_NAME else ""
     name_prefix = f"{xml_escape(spoken_name)}, <break time='120ms'/> " if spoken_name else ""
 
-    # Hinglish word improvement
+    # Hinglish improvements
     improved = improve_hinglish(spoken_text)
 
-    # Wrap likely Hindi words with lang=hi-IN to help pronunciation,
-    # but keep the rest en-IN friendly for Hinglish mix.
-    # (Simple heuristic: if Devanagari exists, wrap the full text in hi-IN.)
+    # If Devanagari present, hint Hindi pronunciation
     if re.search(r"[\u0900-\u097F]", improved):
         body = f"<lang xml:lang='hi-IN'>{xml_escape(improved)}</lang>"
     else:
         body = xml_escape(improved)
 
-    # SSML with prosody + (optional) style
     ssml = f"""<speak version="1.0" xml:lang="en-IN"
     xmlns:mstts="https://www.w3.org/2001/mstts">
   <voice name="{VOICE_NAME}">
@@ -312,7 +351,6 @@ async def speak_in_vc(guild: discord.Guild, text: str, display_name: str):
 
         ssml = make_ssml(text, display_name)
         tts = edge_tts.Communicate(ssml, VOICE_NAME)
-        # edge-tts auto-detects SSML if it sees <speak> markup
         await tts.save(mp3_path)
 
         if vc.is_playing():
@@ -365,6 +403,10 @@ async def cmd_meme(message: discord.Message):
     await type_and_send(message, "Yeh lo ek meme—thoda smile aa jaye bas. 😄")
     await safe_send(message.channel, random.choice(memes))
 
+# Extra: show which instance is replying (diagnose doubles)
+async def cmd_who(message: discord.Message):
+    await type_and_send(message, f"Instance: `{INSTANCE_ID}`")
+
 # =============================
 # Events
 # =============================
@@ -385,10 +427,9 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    # De-dup same message triggering twice
-    if message.id in processed_message_ids:
+    # Single-reply guard for this process
+    if already_processed(message.id):
         return
-    processed_message_ids.add(message.id)
 
     uid = message.author.id
     content = (message.content or "").strip()
@@ -401,6 +442,8 @@ async def on_message(message: discord.Message):
         return await cmd_hello(message)
     if low.startswith("!meme"):
         return await cmd_meme(message)
+    if low.startswith("!who"):
+        return await cmd_who(message)
 
     # Voice commands
     if low.startswith("!joinvc"):
@@ -435,6 +478,13 @@ async def on_message(message: discord.Message):
     async with lock:
         prompt_text = MENTION_RE.sub("", content).strip()
         reply = await generate_reply(uid, prompt_text)
+
+        # Don't send the exact same line twice to this user
+        nr = _norm_reply(reply)
+        if _LAST_REPLY_NORM.get(uid) == nr:
+            reply = re.sub(r"[!? .]+$", "", reply).strip() + " — theek lag raha hai, main saath hoon. 🙂"
+        _LAST_REPLY_NORM[uid] = _norm_reply(reply)
+
         await type_and_send(message, reply)
         try:
             await speak_in_vc(message.guild, reply, message.author.display_name or message.author.name)
