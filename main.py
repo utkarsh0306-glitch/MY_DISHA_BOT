@@ -1,11 +1,4 @@
-# Disha Discord Bot — Human vibe + VC TTS (Render-ready, no vibe control)
-# - Single-reply guard (no doubles)
-# - TTS sanitization (won't read code/mentions/links/YAML)
-# - Stable cute voice (Swara) + optional voice presets
-# - Hinglish pronunciation + username callout (skips emoji names)
-# - Fewer questions; warmer statements
-# - "Talk like the user": auto follow-up window (no need to keep mentioning)
-# - Keep-alive web server (Render)
+# Disha Discord Bot — Human vibe + VC TTS (no code reading) — Render-ready
 
 import os
 import re
@@ -66,10 +59,14 @@ REPLY_COOLDOWN_SEC = 3.5
 SESSION_MAX_TURNS  = 18
 
 # After a direct interaction, keep replying to that person in the same channel
-# without @mention for this many seconds (feels natural).
+# without @mention for this many seconds (feels more natural).
 AUTO_FOLLOW_WINDOW = int(os.getenv("AUTO_FOLLOW_WINDOW", "240"))  # 4 min
 
 QUESTION_RATIO_HINT = "About one out of three replies may end with a short question; otherwise end with a warm statement."
+
+# TTS debug / summary
+DEBUG_TTS = os.getenv("DEBUG_TTS", "0") == "1"  # set to 1 to log speakable text
+CODE_SUMMARY_LINE = "Code block mila—main aloud nahi padhungi. Theek hai, aage chalte hain."
 
 # Diagnostics (to detect duplicate hosts if needed)
 INSTANCE_ID = os.getenv("RENDER_INSTANCE_ID") or os.getenv("HOSTNAME") or str(os.getpid())
@@ -131,7 +128,7 @@ session_turns = {}             # user_id -> turns count
 user_locks = {}                # user_id -> asyncio.Lock
 last_reply_at = {}             # user_id -> ts
 
-# One-reply-per-message
+# One-reply-per-message (within this process)
 _PROCESSED_IDS = set()
 _PROCESSED_ORDER = deque(maxlen=10000)
 _LAST_REPLY_NORM = {}  # user_id -> last normalized reply
@@ -235,19 +232,27 @@ URL_RE         = re.compile(r"https?://\S+")
 MD_LINK_RE     = re.compile(r"\[([^\]]+)\]\([^)]+\)")
 CODE_FENCE_RE  = re.compile(r"```.*?```", re.DOTALL)
 INLINE_CODE_RE = re.compile(r"`[^`]*`")
-YAML_KEYLINE_RE = re.compile(r"^\s*[-]{0,2}\s*[A-Za-z0-9_.-]+:\s*[^#\n]*$", re.MULTILINE)
+
+# YAML / config-ish lines — keep \n intact until after we filter
+YAML_KEYLINE_RE = re.compile(
+    r"(?m)^[ \t\-]*[A-Za-z0-9_.-]+:\s*(?:\"[^\"]*\"|'[^']*'|[^#\n]*)$"
+)
 
 def strip_mentions_links_code(s: str) -> str:
-    s = CODE_FENCE_RE.sub(" ", s)
+    """Remove code fences, inline code, links, mentions, emojis — PRESERVE newlines for YAML filtering."""
+    # Remove big blocks but keep line breaks
+    s = CODE_FENCE_RE.sub("\n", s)
     s = INLINE_CODE_RE.sub(" ", s)
     s = URL_RE.sub(" ", s)
     s = MD_LINK_RE.sub(r"\1", s)
     for rx in (MENTION_TAG_RE, ROLE_TAG_RE, CHANNEL_TAG_RE, TIMESTAMP_TAG_RE, CUSTOM_EMOJI_RE):
         s = rx.sub(" ", s)
     s = UNICODE_EMOJI_RE.sub(" ", s)
+    # Clean markdown symbols but KEEP \n
     s = re.sub(r"[*_~`|>]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    # Collapse spaces/tabs but not newlines
+    s = re.sub(r"[^\S\r\n]+", " ", s)
+    return s.strip()
 
 # Hinglish fixes (roman -> Devanagari for better Hindi voice)
 HINGLISH_MAP = {
@@ -276,27 +281,34 @@ def improve_hinglish(text: str) -> str:
 def get_speakable_text(text: str) -> str:
     """
     Make a safe, human-sounding string for TTS.
-    - Removes code fences, inline code, links, mentions, YAML lines
-    - If it's still code-ish, speak a friendly summary instead of reading it
-    - Applies Hinglish fixes after cleanup
+    - Keeps newlines until YAML removal runs
+    - Drops YAML-like lines, code, links, mentions
+    - If still looks code-ish, returns a short summary line
+    - Applies Hinglish fixes at the end
     """
     original = text or ""
+
+    # Early hard flags → summarize
+    if "```" in original or re.search(r"(?i)\b(render\.yaml|dockerfile|services:|envVars:|FROM |WORKDIR |CMD )", original):
+        return CODE_SUMMARY_LINE
+
+    # Step 1: strip but keep line breaks
     s = strip_mentions_links_code(original)
 
-    # Remove YAML-ish lines completely
-    if YAML_KEYLINE_RE.search(s):
-        s = YAML_KEYLINE_RE.sub(" ", s)
+    # Step 2: drop YAML-looking lines while \n are intact
+    yaml_lines = YAML_KEYLINE_RE.findall(s)
+    s = YAML_KEYLINE_RE.sub(" ", s)
 
-    # Code-ish heuristic
-    sym_ratio = 0.0
-    if s:
-        symbols = sum(c in "{}[]:/\\=;|@" for c in s)
-        sym_ratio = symbols / max(1, len(s))
-    removed_many = len(CODE_FENCE_RE.findall(original)) > 0 or len(YAML_KEYLINE_RE.findall(original)) >= 2
+    # Step 3: now collapse whitespace (including \n)
+    s = re.sub(r"\s+", " ", s).strip()
 
+    # Step 4: code-ish heuristic
+    sym_ratio = (sum(c in "{}[]:/\\=;|@" for c in s) / max(1, len(s))) if s else 1.0
+    removed_many = bool(yaml_lines)
     if (not s) or sym_ratio > 0.08 or removed_many:
-        return "Code block mila—main aloud nahi padhungi. Sab theek lag raha hai, aage chalte hain."
+        return CODE_SUMMARY_LINE
 
+    # Step 5: Hinglish polish + length cap
     s = improve_hinglish(s)
     if len(s) > 260:
         s = s[:250].rsplit(" ", 1)[0] + "…"
@@ -309,8 +321,8 @@ def xml_escape(s: str) -> str:
 def clean_display_name(name: str) -> str:
     if not name:
         return ""
-    name = CUSTOM_EMOJI_RE.sub("", name)
-    name = UNICODE_EMOJI_RE.sub("", name)
+    name = re.sub(r"<a?:[^:>]+:\d+>", "", name)      # custom emoji
+    name = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u26FF]", "", name)  # unicode emoji
     name = re.sub(r"[^A-Za-z0-9 ._-]", "", name).strip()
     name = re.sub(r"\s{2,}", " ", name)
     return name if len(name) >= 2 else ""
@@ -342,14 +354,12 @@ async def leave_vc(guild: discord.Guild):
     if vc and vc.is_connected():
         await vc.disconnect(force=True)
 
-def make_ssml(spoken_text: str, disp_name: str) -> str:
-    speak = get_speakable_text(spoken_text)
-
+def make_ssML(speakable_text: str, disp_name: str) -> str:
+    # expect speakable_text already cleaned by get_speakable_text
     spoken_name = clean_display_name(disp_name) if ENABLE_READ_NAME else ""
     name_prefix = f"{xml_escape(spoken_name)}, <break time='120ms'/> " if spoken_name else ""
-
-    body = xml_escape(speak)
-    ssml = f"""<speak version="1.0" xml:lang="en-IN"
+    body = xml_escape(speakable_text)
+    return f"""<speak version="1.0" xml:lang="en-IN"
     xmlns:mstts="https://www.w3.org/2001/mstts">
   <voice name="{VOICE_NAME}">
     <prosody rate="{VOICE_RATE}" pitch="{VOICE_PITCH}">
@@ -359,7 +369,6 @@ def make_ssml(spoken_text: str, disp_name: str) -> str:
     </prosody>
   </voice>
 </speak>"""
-    return ssml
 
 async def speak_in_vc(guild: discord.Guild, text: str, display_name: str):
     if not ENABLE_TTS:
@@ -372,7 +381,11 @@ async def speak_in_vc(guild: discord.Guild, text: str, display_name: str):
         tmpdir = tempfile.mkdtemp()
         mp3_path = str(pathlib.Path(tmpdir) / "out.mp3")
 
-        ssml = make_ssml(text, display_name)
+        speakable = get_speakable_text(text)
+        if DEBUG_TTS:
+            print("[TTS SPEAKABLE]", speakable)
+
+        ssml = make_ssML(speakable, display_name)
         tts = edge_tts.Communicate(ssml, VOICE_NAME)
         await tts.save(mp3_path)
 
@@ -537,13 +550,19 @@ async def on_message(message: discord.Message):
         _LAST_REPLY_NORM[uid] = _norm_reply(reply)
 
         await type_and_send(message, reply)
+
+        # Speak a strictly sanitized version (won't read code/YAML)
         try:
-            await speak_in_vc(message.guild, reply, message.author.display_name or message.author.name)
+            # Optional: hard stop if reply itself looks like code
+            reply_for_tts = reply
+            if "```" in reply or re.search(r"(?m)^[ \t\-]*[A-Za-z0-9_.-]+:\s*[^#\n]*$", reply):
+                reply_for_tts = CODE_SUMMARY_LINE
+            await speak_in_vc(message.guild, reply_for_tts, message.author.display_name or message.author.name)
         except Exception as e:
             print("[VC TTS WARN]", e)
 
         last_reply_at[uid] = time.time()
-        mark_engaged(message, uid)  # <- extend the natural follow-up window
+        mark_engaged(message, uid)  # extend the natural follow-up window
 
 # =============================
 # Boot
